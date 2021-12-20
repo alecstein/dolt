@@ -17,6 +17,7 @@ package dfunctions
 import (
 	"errors"
 	"fmt"
+	"github.com/dolthub/dolt/go/libraries/doltcore/ref"
 	"strings"
 
 	"github.com/dolthub/go-mysql-server/sql"
@@ -86,6 +87,8 @@ func (d DoltBranchFunc) Eval(ctx *sql.Context, row sql.Row) (interface{}, error)
 		return 1, fmt.Errorf("Could not load database %s", dbName)
 	}
 
+	// TODO: prevent deletion / renaming branches that have connected users that are working on them.
+
 	switch {
 	case apr.Contains(cli.CopyFlag):
 		err = makeACopyOfBranch(ctx, dbData, apr)
@@ -93,19 +96,19 @@ func (d DoltBranchFunc) Eval(ctx *sql.Context, row sql.Row) (interface{}, error)
 			return 1, err
 		}
 	case apr.Contains(cli.MoveFlag):
-		//err = renameBranch(ctx, dbData, apr)
+		err = renameBranch(ctx, dbData, apr)
 		if err != nil {
-			return 1, errors.New("Renaming a branch is not supported.")
+			return 1, err
 		}
 	case apr.Contains(cli.DeleteFlag):
-		//err = deleteBranches(ctx, dbData, apr, apr.Contains(cli.ForceFlag))
+		err = deleteBranches(ctx, dbData, apr, apr.Contains(cli.ForceFlag))
 		if err != nil {
-			return 1, errors.New("Deleting branches is not supported.")
+			return 1, err
 		}
 	case apr.Contains(cli.DeleteForceFlag):
-		//err = deleteBranches(ctx, dbData, apr, true)
+		err = deleteBranches(ctx, dbData, apr, true)
 		if err != nil {
-			return 1, errors.New("Deleting branches is not supported.")
+			return 1, err
 		}
 	default:
 		// regular branch - create new branch
@@ -174,4 +177,152 @@ func copyABranch(ctx *sql.Context, dbData env.DbData, srcBr string, destBr strin
 	}
 
 	return nil
+}
+
+func renameBranch(ctx *sql.Context, dbData env.DbData, apr *argparser.ArgParseResults) error {
+	if apr.NArg() != 2 {
+		return InvalidArgErr
+	}
+
+	oldBr := apr.Args[0]
+	if len(oldBr) == 0 {
+		return EmptyBranchNameErr
+	}
+
+	newBr := apr.Args[1]
+	if len(newBr) == 0 {
+		return EmptyBranchNameErr
+	}
+
+	force := apr.Contains(cli.ForceFlag)
+	err := copyABranch(ctx, dbData, oldBr, newBr, force)
+	if err != nil {
+		return err
+	}
+
+	oldRef := ref.NewBranchRef(oldBr)
+	newRef := ref.NewBranchRef(newBr)
+
+	// TODO : need to handle checkout to different branch outside of the session
+	if ref.Equals(dbData.Rsr.CWBHeadRef(), oldRef) {
+		//err = dbData.Rsw.SetCWBHeadRef(ctx, ref.MarshalableRef{Ref: newRef})
+		//if err != nil {
+		//	return err
+		//}
+		return errors.New("error: Cannot rename checked out branch")
+	}
+
+	fromWSRef, err := ref.WorkingSetRefForHead(oldRef)
+	if err != nil {
+		if !errors.Is(err, ref.ErrWorkingSetUnsupported) {
+			return err
+		}
+	} else {
+		toWSRef, tErr := ref.WorkingSetRefForHead(newRef)
+		if tErr != nil {
+			return tErr
+		}
+		// We always force here, because the CopyBranch up above created
+		// a new branch, and it will have a working set.
+		err = dbData.Ddb.CopyWorkingSet(ctx, fromWSRef, toWSRef, true)
+		if err != nil {
+			return err
+		}
+	}
+
+	err = deleteABranch(ctx, dbData, oldBr, true)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func deleteBranches(ctx *sql.Context, dbData env.DbData, apr *argparser.ArgParseResults, force bool) error {
+	if apr.NArg() == 0 {
+		return InvalidArgErr
+	}
+
+	for _, brName := range apr.Args {
+		if len(brName) == 0 {
+			return EmptyBranchNameErr
+		}
+		err := deleteABranch(ctx, dbData, brName, force)
+		if err != nil {
+			if err == doltdb.ErrBranchNotFound {
+				return errors.New(fmt.Sprintf("fatal: A branch named '%s' not found", brName))
+			} else if err == actions.ErrCOBranchDelete {
+				return errors.New(fmt.Sprintf("error: Cannot delete checked out branch '%s'", brName))
+			} else {
+				return errors.New(fmt.Sprintf("fatal: Unexpected error deleting '%s'", brName))
+			}
+		}
+	}
+
+	return nil
+}
+
+func deleteABranch(ctx *sql.Context, dbData env.DbData, brName string, force bool) error {
+	var remote bool
+	var dref ref.DoltRef
+
+	// TODO : add handling remote branch
+	dref = ref.NewBranchRef(brName)
+	if ref.Equals(dbData.Rsr.CWBHeadRef(), dref) {
+		return errors.New("attempted to delete checked out branch")
+	}
+
+	hasRef, err := dbData.Ddb.HasRef(ctx, dref)
+
+	if err != nil {
+		return err
+	} else if !hasRef {
+		return errors.New(fmt.Sprintf("fatal: A branch named '%s' not found", brName))
+	}
+
+	if !force && !remote {
+		// env.GetDefaultInitBranch(dEnv.Config) => "main"
+		// TODO: get parent commit spec?
+		ms, err := doltdb.NewCommitSpec("main")
+		if err != nil {
+			return err
+		}
+
+		init, err := dbData.Ddb.Resolve(ctx, ms, nil)
+		if err != nil {
+			return err
+		}
+
+		cs, err := doltdb.NewCommitSpec(dref.String())
+		if err != nil {
+			return err
+		}
+
+		cm, err := dbData.Ddb.Resolve(ctx, cs, nil)
+		if err != nil {
+			return err
+		}
+
+		isMerged, _ := init.CanFastReverseTo(ctx, cm)
+		if err != nil && !errors.Is(err, doltdb.ErrUpToDate) {
+			return err
+		}
+		if !isMerged {
+			return errors.New("attempted to delete a branch that is not fully merged into its parent; use `-f` to force")
+		}
+	}
+
+	wsRef, err := ref.WorkingSetRefForHead(dref)
+	if err != nil {
+		if !errors.Is(err, ref.ErrWorkingSetUnsupported) {
+			return err
+		}
+	} else {
+		err = dbData.Ddb.DeleteWorkingSet(ctx, wsRef)
+		if err != nil {
+			return err
+		}
+	}
+
+	return dbData.Ddb.DeleteBranch(ctx, dref)
 }

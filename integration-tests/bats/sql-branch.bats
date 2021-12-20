@@ -124,3 +124,88 @@ SQL
     [ $status -eq 0 ]
     [ "$output" = "$mainhash" ]
 }
+
+@test "sql-branch: DOLT_BRANCH -m renames current branch" {
+    skip "need to handle renaming checked out branch on sql"
+    dolt add . && dolt commit -m "0, 1, and 2 in test table"
+    run dolt status
+    [[ "$output" =~ "main" ]] || false
+
+    # Current branch should be still main with test table without entry 4
+    dolt sql << SQL
+SELECT DOLT_BRANCH('-m', 'main', 'renamed');
+INSERT INTO test VALUES (3);
+SELECT DOLT_COMMIT('-am','add 3');
+SELECT count(*) FROM dolt_branches;
+SQL
+    [ $status -eq 0 ]
+    [[ ! "$output" =~ "2" ]] || false
+
+    run dolt status
+    [ $status -eq 0 ]
+    [[ "$output" =~ "renamed" ]] || false
+    [[ ! "$output" =~ "main" ]] || false
+}
+
+@test "sql-branch: DOLT_BRANCH -m renames branch not checked out" {
+    dolt add . && dolt commit -m "0, 1, and 2 in test table"
+    run dolt status
+    [[ "$output" =~ "main" ]] || false
+
+    dolt branch 'original'
+
+    # Current branch should be still main with test table without entry 4
+    run dolt sql << SQL
+SELECT DOLT_BRANCH('-m', 'original', 'renamed');
+SELECT count(*) FROM dolt_branches;
+SQL
+    [ $status -eq 0 ]
+    [[ "$output" =~ "2" ]] || false
+
+    run dolt branch
+    [ $status -eq 0 ]
+    [[ "$output" =~ "renamed" ]] || false
+    [[ ! "$output" =~ "original" ]] || false
+}
+
+@test "sql-branch: DOLT_BRANCH -d works deleting a branch" {
+    dolt add . && dolt commit -m "0, 1, and 2 in test table"
+    run dolt status
+    [[ "$output" =~ "main" ]] || false
+
+    dolt branch new_branch
+
+    # Current branch should be still main with test table without entry 4
+    run dolt sql << SQL
+SELECT DOLT_BRANCH('-d','new_branch');
+SELECT count(*) FROM dolt_branches;
+SQL
+    [ $status -eq 0 ]
+    [[ ! "$output" =~ "2" ]] || false
+
+    run dolt branch
+    [ $status -eq 0 ]
+    [[ ! "$output" =~ "new_branch" ]] || false
+}
+
+@test "sql-branch: DOLT_BRANCH -d works deleting multiple branches" {
+    dolt add . && dolt commit -m "0, 1, and 2 in test table"
+    run dolt status
+    [[ "$output" =~ "main" ]] || false
+
+    dolt branch branch_one
+    dolt branch branch_two
+
+    # Current branch should be still main with test table without entry 4
+    run dolt sql << SQL
+SELECT DOLT_BRANCH('-d','branch_one','branch_two');
+SELECT count(*) FROM dolt_branches;
+SQL
+    [ $status -eq 0 ]
+    [[ "$output" =~ "1" ]] || false
+
+    run dolt branch
+    [ $status -eq 0 ]
+    [[ ! "$output" =~ "branch_one" ]] || false
+    [[ ! "$output" =~ "branch_two" ]] || false
+}
