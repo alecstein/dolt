@@ -96,6 +96,7 @@ func (d DoltBranchFunc) Eval(ctx *sql.Context, row sql.Row) (interface{}, error)
 			return 1, err
 		}
 	case apr.Contains(cli.MoveFlag):
+		// TODO: check if user tries to rename 'main' branch
 		err = renameBranch(ctx, dbData, apr)
 		if err != nil {
 			return 1, err
